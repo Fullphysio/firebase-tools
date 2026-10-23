@@ -1,3 +1,7 @@
-- [changed] Improve formatting and user experience for Cloud Functions parameter and secret prompts.
-- Updated the Firebase SQL Connect local toolkit to v3.4.20.
-- Added support for deploying scheduled Dart functions (`onSchedule`) to Cloud Run.
+- Ensured the Firebase Hosting API is enabled before deploying and running other Hosting commands.
+- Fixed an issue where empty inputs were accepted for Secret param values in Firebase Functions.
+- Fixed an issue where the Firebase MCP server always suggested `npx firebase-tools@latest` even when the `firebase` CLI was installed.
+- Fixed a Node.js `url.parse()` deprecation warning during `firebase login`.
+- Updated the Firebase SQL Connect local toolkit to v3.4.24, which includes some internal bug fixes.
+- Fixed 2nd Gen Auth Emulator CloudEvent payloads to conform to the Eventarc `google.events.firebase.auth.v2.AuthEventData` wire format (`metadata.createTime`, `providerData[].uid`, and removing `tenantId` from nested user data).
+- Added support for deploying Dart functions with event (Eventarc) and schedule triggers to Cloud Run.

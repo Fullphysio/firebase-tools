@@ -160,7 +160,6 @@ export interface PromptAndWriteKitParamsOptions {
   absSourcePath: string;
   instanceId: string;
   nonInteractive?: boolean;
-  force?: boolean;
   params?: params.Param[];
 }
 
@@ -234,6 +233,25 @@ export function validateNpmPackageName(packageNameOrSpecifier: string): void {
   ) {
     throw new FirebaseError(
       `Invalid NPM package name '${packageNameOrSpecifier}'. Package names must be valid npm package specifiers (e.g. 'my-kit' or '@scope/my-kit').`,
+    );
+  }
+}
+
+/**
+ * Validates that an npm package or package@version specifier has a valid name format
+ * and exists in the npm registry.
+ */
+export async function validateNpmPackageExists(rawPkgName: string): Promise<void> {
+  validateNpmPackageName(rawPkgName);
+  try {
+    const output = await spawnWithOutput("npm", ["view", rawPkgName, "version"]);
+    if (!output.trim()) {
+      throw new Error(`No version found for '${rawPkgName}'`);
+    }
+  } catch (err: unknown) {
+    throw new FirebaseError(
+      `NPM package '${rawPkgName}' could not be found in the npm registry. Please verify the package name and version.`,
+      { original: err instanceof Error ? err : undefined },
     );
   }
 }
@@ -1089,6 +1107,10 @@ export async function promptAndWriteKitParams(
   const parsedSecretRefs = mapObject<string, build.ParsedSecretRef>(secretRefs, (unparsed) =>
     build.parseSecretRef(unparsed),
   );
+  const secretPrefixForInstance = addKitPrefix(options.instanceId);
+  for (const secretParam of options.params.filter((p) => params.isSecretParam(p))) {
+    secretParam.resourceId = `${secretPrefixForInstance}-${secretParam.name}`;
+  }
   build.applyEnvSecretBindingsToParams(options.params, parsedSecretRefs);
 
   let firebaseConfig: FirebaseConfig = { projectId: options.projectId };
@@ -1107,11 +1129,13 @@ export async function promptAndWriteKitParams(
     userEnvs: typedUserEnvs,
     codebase: options.instanceId,
     nonInteractive: options.nonInteractive,
-    force: options.force,
   });
 
   functionsEnv.writeResolvedParams(resolvedEnvs, userEnvs, userEnvOpt);
-  if (experiments.isEnabled("secretEnvParams")) {
+  if (
+    experiments.isEnabled("secretEnvParams") &&
+    experiments.isEnabled("writeDefaultSecretBindings")
+  ) {
     functionsEnv.writeResolvedSecretRefs(resolvedSecretRefs, secretRefs, userEnvOpt);
   }
 }
@@ -1128,7 +1152,7 @@ export async function printKitFirstDeployReport(
     discoveredBuild = options.preDiscoveredBuild
       ? cloneDeep(options.preDiscoveredBuild)
       : await discoverKitBuild(options, options.absSourcePath);
-    build.applyPrefix(discoveredBuild, prefix);
+    build.applyEndpointPrefix(discoveredBuild, prefix);
   } catch (err: unknown) {
     logger.debug(`Could not discover kit build for reporting: ${getErrMsg(err)}`);
     return;
@@ -1351,7 +1375,6 @@ export async function addKitInstanceOrConfigureProject(
         absSourcePath,
         instanceId,
         nonInteractive: options.nonInteractive,
-        force: options.force,
         params: discoveredBuild.params,
       });
     }
@@ -1436,7 +1459,7 @@ export async function resolvePackageSource(
     throw new FirebaseError("Set the --package option to a valid NPM package and try again.");
   }
 
-  validateNpmPackageName(rawPkgName);
+  await validateNpmPackageExists(rawPkgName);
   const { packageName } = parseNpmPackageSpecifier(rawPkgName);
 
   const isThirdParty = await promptSecurityConfirmation({
@@ -1507,6 +1530,10 @@ export async function installKitOrInstance(
   }
   if (options.directory && options.template) {
     throw new FirebaseError("Cannot specify --template with --directory.");
+  }
+
+  if (options.package) {
+    validateNpmPackageName(options.package);
   }
 
   const originalFunctions = cloneDeep(options.config.src.functions);
@@ -1601,7 +1628,6 @@ export async function installKitOrInstance(
           absSourcePath,
           instanceId,
           nonInteractive: options.nonInteractive,
-          force: options.force,
           params: discoveredBuild.params,
         });
       }
