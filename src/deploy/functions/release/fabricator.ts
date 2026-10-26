@@ -1,7 +1,16 @@
 import * as clc from "colorette";
 
-import { DEFAULT_RETRY_CODES, Executor } from "./executor";
-import { FirebaseError, getErrStatus } from "../../../error";
+import {
+  Executor,
+  hasErrorCode,
+  isCloudRunResourceExhausted,
+  isServiceAccountPropagationError,
+  isTransientError,
+  parseErrorCode,
+} from "./executor";
+import * as ensure from "../ensure";
+import { FirebaseError, getError, getErrStack, getErrStatus } from "../../../error";
+
 import { SourceTokenScraper } from "./sourceTokenScraper";
 import { Timer } from "./timer";
 import { assertExhaustive } from "../../../functional";
@@ -77,6 +86,18 @@ const rethrowAs =
     throw new reporter.DeploymentError(endpoint, op, err);
   };
 
+// A 404 while deleting means the resource is already gone — the desired end
+// state — so treat it as success rather than failing the deployment. See #4795.
+const rethrowAsUnlessNotFound =
+  <T>(endpoint: backend.Endpoint, op: reporter.OperationType) =>
+  (err: unknown): T | void => {
+    if (parseErrorCode(err) === 404) {
+      logger.debug(`Ignoring 404 for ${op} on ${endpoint.id}; resource already deleted.`);
+      return;
+    }
+    return rethrowAs<T>(endpoint, op)(err);
+  };
+
 /** Fabricators make a customer's backend match a spec by applying a plan. */
 export class Fabricator {
   executor: Executor;
@@ -98,6 +119,7 @@ export class Fabricator {
   }
 
   async grantNewRoles(plan: planner.CodebasePlan, codebase: string): Promise<void> {
+    let createdSA = false;
     if (plan.serviceAccountToCreate) {
       utils.logLabeledBullet(
         "functions",
@@ -111,6 +133,7 @@ export class Fabricator {
           `Managed by Firebase CLI for codebase ${codebase}`,
           `Firebase Functions ${codebase}`,
         );
+        createdSA = true;
       } catch (e) {
         throw new FirebaseError(
           "Cannot enable declarative security because you do not have permissions necessary to create the service account. Please ask an IAM administrator to perform the next deploy.",
@@ -133,6 +156,16 @@ export class Fabricator {
           true, // skipAccountLookup
         );
       } catch (e) {
+        if (createdSA && plan.serviceAccountToCreate) {
+          try {
+            await iam.deleteServiceAccount(this.projectId, plan.serviceAccountToCreate);
+          } catch (cleanupErr) {
+            logger.debug(
+              "Failed to clean up newly created service account after role grant error",
+              cleanupErr,
+            );
+          }
+        }
         throw new FirebaseError(
           "The declarative security roles for this codebase have changed, but you do not have access to see what has changed. Please ask an IAM administrator to perform the next deploy.",
           { original: e as Error },
@@ -213,6 +246,23 @@ export class Fabricator {
       await this.grantNewRoles(codebasePlan, codebase);
     }
 
+    const secretAccessPromises = Object.values(plan).flatMap((codebasePlan) =>
+      Object.entries(codebasePlan.secretAccessPlan || {}).map(([secret, serviceAccounts]) =>
+        this.executor.run(
+          () =>
+            ensure.grantSecretAccess({
+              projectId: this.projectId,
+              secret,
+              serviceAccounts,
+            }),
+          {
+            retryPredicates: [isTransientError, isServiceAccountPropagationError],
+          },
+        ),
+      ),
+    );
+    await Promise.all(secretAccessPromises);
+
     // Accumulate all regional changesets across all codebases
     const allChangesets: planner.Changeset[] = [];
     for (const codebasePlan of Object.values(plan)) {
@@ -228,17 +278,36 @@ export class Fabricator {
     const createAndUpdateResultsArray = await Promise.allSettled(createAndUpdatePromises);
 
     // Process results of Phase 1
+    const upsertErrors: Error[] = [];
     summary.results = createAndUpdateResultsArray.reduce<reporter.DeployResult[]>((acc, r) => {
       if (r.status === "fulfilled") {
         return [...acc, ...r.value];
       }
       // Handle rejection
+      upsertErrors.push(getError(r.reason));
       logger.debug(
         "Fabricator.applyUpserts returned an unhandled exception.",
-        JSON.stringify(r.reason, null, 2),
+        getErrStack(r.reason),
       );
       return acc;
     }, []);
+
+    await this.cleanupUnusedServiceAccounts(plan, summary.results);
+
+    // If applyUpserts rejected outside wrapOperation, fail immediately instead of
+    // proceeding to function deletions with an incomplete result set and exiting 0.
+    if (upsertErrors.length) {
+      const opts =
+        upsertErrors.length === 1 ? { original: upsertErrors[0] } : { children: upsertErrors };
+      const msg =
+        upsertErrors.length === 1
+          ? `Fabricator.applyUpserts encountered an unhandled exception: ${upsertErrors[0].message}`
+          : "Fabricator.applyUpserts encountered unhandled exceptions";
+      throw new FirebaseError(msg, {
+        ...opts,
+        exit: 2,
+      });
+    }
 
     const hasFailures = summary.results.some((r) => r.error);
 
@@ -263,18 +332,35 @@ export class Fabricator {
       allChangesets.map((changes) => this.applyDeletes(changes)),
     );
 
+    const deleteErrors: Error[] = [];
     const deleteResults = deleteResultsArray.reduce<reporter.DeployResult[]>((acc, r) => {
       if (r.status === "fulfilled") {
         return [...acc, ...r.value];
       }
+      deleteErrors.push(getError(r.reason));
       logger.debug(
         "Fabricator.applyDeletes returned an unhandled exception. This should never happen",
-        JSON.stringify(r.reason, null, 2),
+        getErrStack(r.reason),
       );
       return acc;
     }, []);
 
     summary.results.push(...deleteResults);
+
+    // If applyDeletes rejected outside wrapOperation, fail instead of returning
+    // an incomplete summary that allows the deploy to succeed with exit code 0.
+    if (deleteErrors.length) {
+      const opts =
+        deleteErrors.length === 1 ? { original: deleteErrors[0] } : { children: deleteErrors };
+      const msg =
+        deleteErrors.length === 1
+          ? `Fabricator.applyDeletes encountered an unhandled exception: ${deleteErrors[0].message}`
+          : "Fabricator.applyDeletes encountered unhandled exceptions";
+      throw new FirebaseError(msg, {
+        ...opts,
+        exit: 2,
+      });
+    }
 
     // Similarly to grantNewRoles, we execute role removals sequentially to avoid concurrent
     // IAM policy update conflicts (409 Conflict / etag mismatch) on GCP.
@@ -286,6 +372,33 @@ export class Fabricator {
     return summary;
   }
 
+  private async cleanupUnusedServiceAccounts(
+    plan: planner.DeploymentPlan,
+    results: reporter.DeployResult[],
+  ): Promise<void> {
+    for (const [codebase, codebasePlan] of Object.entries(plan)) {
+      if (!codebasePlan.serviceAccountToCreate) {
+        continue;
+      }
+      const codebaseSuccesses = results.filter((r) => r.endpoint.codebase === codebase && !r.error);
+      if (codebaseSuccesses.length > 0) {
+        continue;
+      }
+      utils.logLabeledWarning(
+        "functions",
+        `Cleaning up managed service account ${codebasePlan.serviceAccountToCreate} due to 100% deployment failure for codebase ${codebase}.`,
+      );
+      try {
+        await iam.deleteServiceAccount(this.projectId, codebasePlan.serviceAccountToCreate);
+      } catch (e) {
+        logger.debug(
+          `Failed to delete managed service account ${codebasePlan.serviceAccountToCreate} during failure cleanup`,
+          e,
+        );
+      }
+    }
+  }
+
   async applyUpserts(
     changes: planner.Changeset,
     scraperV1: SourceTokenScraper,
@@ -294,11 +407,11 @@ export class Fabricator {
     const ops: Array<Promise<reporter.DeployResult>> = [];
 
     for (const endpoint of changes.endpointsToCreate) {
-      this.logOpStart("creating", endpoint);
       ops.push(
-        this.wrapOperation("create", endpoint, () =>
-          this.createEndpoint(endpoint, scraperV1, scraperV2),
-        ),
+        this.wrapOperation("create", endpoint, () => {
+          this.logOpStart("creating", endpoint);
+          return this.createEndpoint(endpoint, scraperV1, scraperV2);
+        }),
       );
     }
 
@@ -307,11 +420,11 @@ export class Fabricator {
     }
 
     for (const update of changes.endpointsToUpdate) {
-      this.logOpStart("updating", update.endpoint);
       ops.push(
-        this.wrapOperation("update", update.endpoint, () =>
-          this.updateEndpoint(update, scraperV1, scraperV2),
-        ),
+        this.wrapOperation("update", update.endpoint, () => {
+          this.logOpStart("updating", update.endpoint);
+          return this.updateEndpoint(update, scraperV1, scraperV2);
+        }),
       );
     }
 
@@ -322,8 +435,12 @@ export class Fabricator {
     const ops: Array<Promise<reporter.DeployResult>> = [];
 
     for (const endpoint of changes.endpointsToDelete) {
-      this.logOpStart("deleting", endpoint);
-      ops.push(this.wrapOperation("delete", endpoint, () => this.deleteEndpoint(endpoint)));
+      ops.push(
+        this.wrapOperation("delete", endpoint, () => {
+          this.logOpStart("deleting", endpoint);
+          return this.deleteEndpoint(endpoint);
+        }),
+      );
     }
 
     return Promise.all(ops);
@@ -416,17 +533,25 @@ export class Fabricator {
       apiFunction.httpsTrigger.securityLevel = "SECURE_ALWAYS";
     }
     const resultFunction = await this.functionExecutor
-      .run(async () => {
-        // try to get the source token right before deploying
-        apiFunction.sourceToken = await scraper.getToken();
-        const op: { name: string } = await gcf.createFunction(apiFunction);
-        return poller.pollOperation<gcf.CloudFunction>({
-          ...gcfV1PollerOptions,
-          pollerName: `create-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
-          operationResourceName: op.name,
-          onPoll: scraper.poller,
-        });
-      })
+      .run(
+        () =>
+          scraper.withToken(async (token) => {
+            // Clear any token from a previous attempt so retries do not send a stale token.
+            // Explicitly delete instead of setting undefined so proto.fieldMasks() omits it.
+            delete apiFunction.sourceToken;
+            if (token) {
+              apiFunction.sourceToken = token;
+            }
+            const op: { name: string } = await gcf.createFunction(apiFunction);
+            return await poller.pollOperation<gcf.CloudFunction>({
+              ...gcfV1PollerOptions,
+              pollerName: `create-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
+              operationResourceName: op.name,
+              onPoll: scraper.poller,
+            });
+          }),
+        { retryPredicates: [isTransientError, isServiceAccountPropagationError] },
+      )
       .catch(rethrowAs<gcf.CloudFunction>(endpoint, "create"));
 
     endpoint.uri = resultFunction?.httpsTrigger?.url;
@@ -544,22 +669,28 @@ export class Fabricator {
     let resultFunction: gcfV2.OutputCloudFunction | null = null;
     while (!resultFunction) {
       resultFunction = await this.functionExecutor
-        .run(async () => {
-          if (experiments.isEnabled("functionsv2deployoptimizations")) {
-            apiFunction.buildConfig.sourceToken = await scraper.getToken();
-          }
-          const op: { name: string } = await gcfV2.createFunction(apiFunction);
-          return await poller.pollOperation<gcfV2.OutputCloudFunction>({
-            ...gcfV2PollerOptions,
-            pollerName: `create-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
-            operationResourceName: op.name,
-            onPoll: scraper.poller,
-          });
-        })
+        .run(
+          () =>
+            scraper.withToken(async (token) => {
+              if (apiFunction.buildConfig) {
+                // Clear any token from a previous attempt so retries do not send a stale token.
+                // Explicitly delete instead of setting undefined so proto.fieldMasks() omits it.
+                delete apiFunction.buildConfig.sourceToken;
+                if (experiments.isEnabled("functionsv2deployoptimizations") && token) {
+                  apiFunction.buildConfig.sourceToken = token;
+                }
+              }
+              const op: { name: string } = await gcfV2.createFunction(apiFunction);
+              return await poller.pollOperation<gcfV2.OutputCloudFunction>({
+                ...gcfV2PollerOptions,
+                pollerName: `create-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
+                operationResourceName: op.name,
+                onPoll: scraper.poller,
+              });
+            }),
+          { retryPredicates: [isTransientError, isServiceAccountPropagationError] },
+        )
         .catch(async (err: any) => {
-          // Abort waiting on source token so other concurrent calls don't get stuck
-          scraper.abort();
-
           // If the createFunction call returns RPC error code RESOURCE_EXHAUSTED (8),
           // we have exhausted the underlying Cloud Run API quota. To retry, we need to
           // first delete the GCF function resource, then call createFunction again.
@@ -644,16 +775,25 @@ export class Fabricator {
     const apiFunction = gcf.functionFromEndpoint(endpoint, sourceUrl);
 
     const resultFunction = await this.functionExecutor
-      .run(async () => {
-        apiFunction.sourceToken = await scraper.getToken();
-        const op: { name: string } = await gcf.updateFunction(apiFunction);
-        return await poller.pollOperation<gcf.CloudFunction>({
-          ...gcfV1PollerOptions,
-          pollerName: `update-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
-          operationResourceName: op.name,
-          onPoll: scraper.poller,
-        });
-      })
+      .run(
+        () =>
+          scraper.withToken(async (token) => {
+            // Clear any token from a previous attempt so retries do not send a stale token.
+            // Explicitly delete instead of setting undefined so proto.fieldMasks() omits it.
+            delete apiFunction.sourceToken;
+            if (token) {
+              apiFunction.sourceToken = token;
+            }
+            const op: { name: string } = await gcf.updateFunction(apiFunction);
+            return await poller.pollOperation<gcf.CloudFunction>({
+              ...gcfV1PollerOptions,
+              pollerName: `update-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
+              operationResourceName: op.name,
+              onPoll: scraper.poller,
+            });
+          }),
+        { retryPredicates: [isTransientError, isServiceAccountPropagationError] },
+      )
       .catch(rethrowAs<gcf.CloudFunction>(endpoint, "update"));
 
     endpoint.uri = resultFunction?.httpsTrigger?.url;
@@ -669,8 +809,11 @@ export class Fabricator {
       invoker = ["public"];
     }
     if (invoker) {
+      const invokerUpdate = invoker;
       await this.executor
-        .run(() => gcf.setInvokerUpdate(endpoint.project, backend.functionName(endpoint), invoker!))
+        .run(() =>
+          gcf.setInvokerUpdate(endpoint.project, backend.functionName(endpoint), invokerUpdate),
+        )
         .catch(rethrowAs(endpoint, "set invoker"));
     }
   }
@@ -693,22 +836,33 @@ export class Fabricator {
 
     const resultFunction = await this.functionExecutor
       .run(
-        async () => {
-          if (experiments.isEnabled("functionsv2deployoptimizations")) {
-            apiFunction.buildConfig.sourceToken = await scraper.getToken();
-          }
-          const op: { name: string } = await gcfV2.updateFunction(apiFunction);
-          return await poller.pollOperation<gcfV2.OutputCloudFunction>({
-            ...gcfV2PollerOptions,
-            pollerName: `update-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
-            operationResourceName: op.name,
-            onPoll: scraper.poller,
-          });
+        () =>
+          scraper.withToken(async (token) => {
+            if (apiFunction.buildConfig) {
+              // Clear any token from a previous attempt so retries do not send a stale token.
+              // Explicitly delete instead of setting undefined so proto.fieldMasks() omits it.
+              delete apiFunction.buildConfig.sourceToken;
+              if (experiments.isEnabled("functionsv2deployoptimizations") && token) {
+                apiFunction.buildConfig.sourceToken = token;
+              }
+            }
+            const op: { name: string } = await gcfV2.updateFunction(apiFunction);
+            return await poller.pollOperation<gcfV2.OutputCloudFunction>({
+              ...gcfV2PollerOptions,
+              pollerName: `update-${endpoint.codebase}-${endpoint.region}-${endpoint.id}`,
+              operationResourceName: op.name,
+              onPoll: scraper.poller,
+            });
+          }),
+        {
+          retryPredicates: [
+            isTransientError,
+            isCloudRunResourceExhausted,
+            isServiceAccountPropagationError,
+          ],
         },
-        { retryCodes: [...DEFAULT_RETRY_CODES, CLOUD_RUN_RESOURCE_EXHAUSTED_CODE] },
       )
       .catch((err: any) => {
-        scraper.abort();
         logger.error((err as Error).message);
         throw new reporter.DeploymentError(endpoint, "update", err);
       });
@@ -749,8 +903,9 @@ export class Fabricator {
     }
 
     if (invoker) {
+      const invokerUpdate = invoker;
       await this.executor
-        .run(() => run.setInvokerUpdate(endpoint.project, serviceName, invoker!))
+        .run(() => run.setInvokerUpdate(endpoint.project, serviceName, invokerUpdate))
         .catch(rethrowAs(endpoint, "set invoker"));
     }
   }
@@ -783,7 +938,13 @@ export class Fabricator {
           };
           await poller.pollOperation<void>(pollerOptions);
         },
-        { retryCodes: [...DEFAULT_RETRY_CODES, CLOUD_RUN_RESOURCE_EXHAUSTED_CODE] },
+        {
+          retryPredicates: [
+            isTransientError,
+            isCloudRunResourceExhausted,
+            isServiceAccountPropagationError,
+          ],
+        },
       )
       .catch(rethrowAs(endpoint, "delete"));
   }
@@ -809,11 +970,19 @@ export class Fabricator {
 
     const serviceId = runV2.functionNameToServiceName(endpoint.id);
     await this.runFunctionExecutor
-      .run(async () => {
-        const op = await runV2.createService(endpoint.project, endpoint.region, serviceId, service);
-        endpoint.uri = op.uri;
-        endpoint.runServiceId = serviceId;
-      })
+      .run(
+        async () => {
+          const op = await runV2.createService(
+            endpoint.project,
+            endpoint.region,
+            serviceId,
+            service,
+          );
+          endpoint.uri = op.uri;
+          endpoint.runServiceId = serviceId;
+        },
+        { retryPredicates: [isTransientError, isServiceAccountPropagationError] },
+      )
       .catch(rethrowAs(endpoint, "create"));
 
     const serviceName = `projects/${endpoint.project}/locations/${endpoint.region}/services/${endpoint.runServiceId}`;
@@ -869,8 +1038,9 @@ export class Fabricator {
     }
 
     if (invoker) {
+      const invokerUpdate = invoker;
       await this.executor
-        .run(() => run.setInvokerUpdate(endpoint.project, serviceName, invoker!))
+        .run(() => run.setInvokerUpdate(endpoint.project, serviceName, invokerUpdate))
         .catch(rethrowAs(endpoint, "set invoker"));
     }
   }
@@ -1070,7 +1240,7 @@ export class Fabricator {
       );
       try {
         const op = await this.executor.run(() => eventarc.createTrigger(trigger), {
-          retryCodes: [429, 503],
+          retryPredicates: [hasErrorCode(429, 503)],
         });
         await poller.pollOperation<eventarc.Trigger>({
           ...eventarcPollerOptions,
@@ -1145,7 +1315,7 @@ export class Fabricator {
                 operationResourceName: op.name,
               });
             },
-            { retryCodes: [] },
+            { retryPredicates: [] },
           );
         } catch (err) {
           if (replacementStarted) {
@@ -1262,28 +1432,24 @@ export class Fabricator {
     const jobName = scheduler.jobNameForEndpoint(endpoint, this.appEngineLocation);
     await this.executor
       .run(() => scheduler.deleteJob(jobName))
-      .catch(rethrowAs(endpoint, "delete schedule"));
+      .catch(rethrowAsUnlessNotFound(endpoint, "delete schedule"));
 
     const topicName = scheduler.topicNameForEndpoint(endpoint);
     await this.executor
       .run(() => pubsub.deleteTopic(topicName))
-      .catch(rethrowAs(endpoint, "delete topic"));
+      .catch(rethrowAsUnlessNotFound(endpoint, "delete topic"));
   }
 
   async deleteScheduleV2(endpoint: backend.Endpoint & backend.ScheduleTriggered): Promise<void> {
     const jobName = scheduler.jobNameForEndpoint(endpoint, endpoint.region);
     await this.executor
       .run(() => scheduler.deleteJob(jobName))
-      .catch(rethrowAs(endpoint, "delete schedule"));
+      .catch(rethrowAsUnlessNotFound(endpoint, "delete schedule"));
   }
 
   async disableTaskQueue(endpoint: backend.Endpoint & backend.TaskQueueTriggered): Promise<void> {
-    const update = {
-      name: cloudtasks.queueNameForEndpoint(endpoint),
-      state: "DISABLED" as cloudtasks.State,
-    };
     await this.executor
-      .run(() => cloudtasks.updateQueue(update))
+      .run(() => cloudtasks.disableQueue(cloudtasks.queueNameForEndpoint(endpoint)))
       .catch(rethrowAs(endpoint, "disable task queue"));
   }
 
@@ -1296,7 +1462,9 @@ export class Fabricator {
   }
 
   logOpStart(op: string, endpoint: backend.Endpoint): void {
-    const runtime = endpoint.runtime ? RUNTIMES[endpoint.runtime].friendly : "unknown";
+    const runtime = endpoint.runtime
+      ? RUNTIMES[endpoint.runtime]?.friendly ?? endpoint.runtime
+      : "unknown";
     const platform = getHumanFriendlyPlatformName(endpoint.platform);
     const label = helper.getFunctionLabel(endpoint);
     utils.logLabeledBullet(
