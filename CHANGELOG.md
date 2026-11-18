@@ -5,3 +5,4 @@
 - Updated the Firebase SQL Connect local toolkit to v3.4.24, which includes some internal bug fixes.
 - Fixed 2nd Gen Auth Emulator CloudEvent payloads to conform to the Eventarc `google.events.firebase.auth.v2.AuthEventData` wire format (`metadata.createTime`, `providerData[].uid`, and removing `tenantId` from nested user data).
 - Added support for deploying Dart functions with event (Eventarc) and schedule triggers to Cloud Run.
+- Fixed deleting a 2nd gen auth blocking function leaving it registered in Identity Platform after it was updated, which made every sign-up or sign-in fail.
