@@ -607,6 +607,7 @@ export interface FirebaseFunctionMetadata {
   eventTrigger?: backend.EventTrigger;
   scheduleTrigger?: backend.ScheduleTrigger;
   blockingTrigger?: backend.BlockingTrigger;
+  taskQueueTrigger?: backend.TaskQueueTrigger;
 }
 
 // Partial implementation. A full implementation may require more refactoring.
@@ -674,23 +675,25 @@ export function endpointFromService(service: Omit<Service, ServiceOutputFields>)
         ? { scheduleTrigger: metadata.scheduleTrigger }
         : metadata.blockingTrigger
           ? { blockingTrigger: metadata.blockingTrigger }
-          : signatureType === "cloudevent"
-            ? {
-                eventTrigger: {
-                  eventType: service.annotations?.[TRIGGER_TYPE_ANNOTATION] || "unknown",
-                  retry: false,
-                },
-              }
-            : !service.annotations?.[TRIGGER_TYPE_ANNOTATION] ||
-                service.annotations?.[TRIGGER_TYPE_ANNOTATION] === "HTTP_TRIGGER"
-              ? { httpsTrigger: {} }
-              : {
+          : metadata.taskQueueTrigger
+            ? { taskQueueTrigger: metadata.taskQueueTrigger }
+            : signatureType === "cloudevent"
+              ? {
                   eventTrigger: {
                     eventType: service.annotations?.[TRIGGER_TYPE_ANNOTATION] || "unknown",
-                    // TODO: Figure out how to recover retry info for services not created by Firebase.
                     retry: false,
                   },
-                }),
+                }
+              : !service.annotations?.[TRIGGER_TYPE_ANNOTATION] ||
+                  service.annotations?.[TRIGGER_TYPE_ANNOTATION] === "HTTP_TRIGGER"
+                ? { httpsTrigger: {} }
+                : {
+                    eventTrigger: {
+                      eventType: service.annotations?.[TRIGGER_TYPE_ANNOTATION] || "unknown",
+                      // TODO: Figure out how to recover retry info for services not created by Firebase.
+                      retry: false,
+                    },
+                  }),
   };
   endpoint.runServiceId = svcId;
   proto.copyIfPresent(endpoint, service, "uri");
@@ -757,6 +760,9 @@ export function serviceFromEndpoint(
         : {}),
       ...(backend.isBlockingTriggered(endpoint)
         ? { blockingTrigger: endpoint.blockingTrigger }
+        : {}),
+      ...(backend.isTaskQueueTriggered(endpoint)
+        ? { taskQueueTrigger: endpoint.taskQueueTrigger }
         : {}),
     }),
   };

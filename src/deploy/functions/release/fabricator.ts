@@ -999,6 +999,13 @@ export class Fabricator {
       await this.executor
         .run(() => run.setInvokerCreate(endpoint.project, serviceName, invoker))
         .catch(rethrowAs(endpoint, "set invoker"));
+    } else if (backend.isTaskQueueTriggered(endpoint)) {
+      const invoker = endpoint.taskQueueTrigger.invoker;
+      if (invoker && !invoker.includes("private")) {
+        await this.executor
+          .run(() => run.setInvokerCreate(endpoint.project, serviceName, invoker))
+          .catch(rethrowAs(endpoint, "set invoker"));
+      }
     } else if (
       backend.isBlockingTriggered(endpoint) &&
       AUTH_BLOCKING_EVENTS.includes(endpoint.blockingTrigger.eventType as any)
@@ -1045,6 +1052,8 @@ export class Fabricator {
       invoker = endpoint.httpsTrigger.invoker === null ? ["public"] : endpoint.httpsTrigger.invoker;
     } else if (backend.isScheduleTriggered(endpoint)) {
       invoker = [await this.scheduleInvoker(endpoint)];
+    } else if (backend.isTaskQueueTriggered(endpoint)) {
+      invoker = endpoint.taskQueueTrigger.invoker === null ? [] : endpoint.taskQueueTrigger.invoker;
     } else if (
       backend.isBlockingTriggered(endpoint) &&
       AUTH_BLOCKING_EVENTS.includes(endpoint.blockingTrigger.eventType as any)
@@ -1136,11 +1145,6 @@ export class Fabricator {
       }
       assertExhaustive(endpoint.platform);
     } else if (backend.isTaskQueueTriggered(endpoint)) {
-      if (endpoint.platform === "run") {
-        throw new FirebaseError(
-          "Task Queue triggers for Cloud Run functions are not supported yet.",
-        );
-      }
       await this.upsertTaskQueue(endpoint);
     } else if (backend.isBlockingTriggered(endpoint)) {
       await this.registerBlockingTrigger(endpoint);
@@ -1160,11 +1164,6 @@ export class Fabricator {
       }
       assertExhaustive(endpoint.platform);
     } else if (backend.isTaskQueueTriggered(endpoint)) {
-      if (endpoint.platform === "run") {
-        throw new FirebaseError(
-          "Task Queue triggers for Cloud Run functions are not supported yet.",
-        );
-      }
       await this.disableTaskQueue(endpoint);
     } else if (backend.isBlockingTriggered(endpoint)) {
       await this.unregisterBlockingTrigger(endpoint);

@@ -137,6 +137,26 @@ describe("runv2", () => {
       expect(reconstructed.uri).to.equal("https://service-abc-ey.a.run.app");
     });
 
+    it("should preserve task queue trigger metadata for backend reconstruction", () => {
+      const taskQueueTrigger: backend.TaskQueueTrigger = {
+        retryConfig: { maxAttempts: 3, minBackoffSeconds: 60 },
+        rateLimits: { maxConcurrentDispatches: 6 },
+      };
+      const endpoint: backend.Endpoint = { ...BASE_ENDPOINT_RUN, taskQueueTrigger };
+
+      const service = runv2.serviceFromEndpoint(endpoint, IMAGE_URI);
+      const metadata = JSON.parse(service.annotations![runv2.FIREBASE_FUNCTION_METADTA_ANNOTATION]);
+
+      expect(metadata).to.deep.equal({ functionId: FUNCTION_ID, taskQueueTrigger });
+      const reconstructed = runv2.endpointFromService(service);
+      expect(backend.isTaskQueueTriggered(reconstructed)).to.be.true;
+      expect(backend.isHttpsTriggered(reconstructed)).to.be.false;
+      if (!backend.isTaskQueueTriggered(reconstructed)) {
+        throw new Error("Expected a task-queue-triggered endpoint");
+      }
+      expect(reconstructed.taskQueueTrigger).to.deep.equal(taskQueueTrigger);
+    });
+
     it("should preserve event trigger metadata for backend reconstruction", () => {
       const eventTrigger: backend.EventTrigger = {
         eventType: "google.cloud.firestore.document.v1.written",

@@ -7,3 +7,4 @@
 - Added support for deploying Dart functions with event (Eventarc) and schedule triggers to Cloud Run.
 - Fixed deleting a 2nd gen auth blocking function leaving it registered in Identity Platform after it was updated, which made every sign-up or sign-in fail.
 - Added support for deploying Auth blocking triggers (`beforeUserCreated`, `beforeUserSignedIn`, ...) for Dart Cloud Run functions.
+- Added support for deploying task queue triggers (`onTaskDispatched`) for Dart Cloud Run functions.
