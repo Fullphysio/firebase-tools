@@ -6,3 +6,4 @@
 - Fixed 2nd Gen Auth Emulator CloudEvent payloads to conform to the Eventarc `google.events.firebase.auth.v2.AuthEventData` wire format (`metadata.createTime`, `providerData[].uid`, and removing `tenantId` from nested user data).
 - Added support for deploying Dart functions with event (Eventarc) and schedule triggers to Cloud Run.
 - Fixed deleting a 2nd gen auth blocking function leaving it registered in Identity Platform after it was updated, which made every sign-up or sign-in fail.
+- Added support for deploying Auth blocking triggers (`beforeUserCreated`, `beforeUserSignedIn`, ...) for Dart Cloud Run functions.
