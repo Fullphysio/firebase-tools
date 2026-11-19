@@ -1001,7 +1001,7 @@ export class Fabricator {
         .catch(rethrowAs(endpoint, "set invoker"));
     } else if (backend.isTaskQueueTriggered(endpoint)) {
       const invoker = endpoint.taskQueueTrigger.invoker;
-      if (invoker && !invoker.includes("private")) {
+      if (invoker && invoker.length > 0 && !invoker.includes("private")) {
         await this.executor
           .run(() => run.setInvokerCreate(endpoint.project, serviceName, invoker))
           .catch(rethrowAs(endpoint, "set invoker"));
@@ -1053,7 +1053,10 @@ export class Fabricator {
     } else if (backend.isScheduleTriggered(endpoint)) {
       invoker = [await this.scheduleInvoker(endpoint)];
     } else if (backend.isTaskQueueTriggered(endpoint)) {
-      invoker = endpoint.taskQueueTrigger.invoker === null ? [] : endpoint.taskQueueTrigger.invoker;
+      invoker =
+        endpoint.taskQueueTrigger.invoker === null
+          ? ["private"]
+          : endpoint.taskQueueTrigger.invoker;
     } else if (
       backend.isBlockingTriggered(endpoint) &&
       AUTH_BLOCKING_EVENTS.includes(endpoint.blockingTrigger.eventType as any)
